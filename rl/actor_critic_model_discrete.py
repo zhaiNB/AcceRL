@@ -1,14 +1,29 @@
+# MuJoCo / 仿真：强制 CPU 软件渲染，禁用 EGL/GPU 渲染（须在 import mujoco 之前设置）
+import os
+
+os.environ.setdefault("MUJOCO_GL", "osmesa")
+os.environ.setdefault("PYOPENGL_PLATFORM", "osmesa")
+os.environ.setdefault("OMP_NUM_THREADS", "1")
+os.environ.setdefault("MKL_NUM_THREADS", "1")
+os.environ.setdefault("TF_ENABLE_ONEDNN_OPTS", "0")
+
+# TensorFlow 仅被 sole_utils 间接用于数据处理，禁止占用 GPU（避免与 PyTorch 抢 8 张 H20）
+import tensorflow as tf
+
+try:
+    tf.config.set_visible_devices([], "GPU")
+except Exception:
+    pass
 
 import time
 import random
-import os
 import warnings
 from pathlib import Path
+from typing import Dict, Any, Tuple, List
 
+import numpy as np
 import torch
 import torch.nn as nn
-from typing import Dict, Any, Tuple, List
-import numpy as np
 from peft import LoraConfig, get_peft_model
 
 # Core OpenVLA components
@@ -573,11 +588,13 @@ if __name__ == "__main__":
     BENCHMARK = TaskSuite.LIBERO_OBJECT.value
     print(f"BENCHMARK: {BENCHMARK}")
     unnorm_key = f"{BENCHMARK}_no_noops"
-    spatial_checkpoint = "/mnt/data/lcx2/yanjieworkspace/models/finetune_im/openvla-7b+libero_spatial_no_noops+b32+lr-0.0005+lora-r32+dropout-0.0--image_aug--parallel_dec--8_acts_chunk--discrete_acts--proprio_state--100000_chkpt"
-    goal_checkpoint="/cpfs01/liuwei_workspace/models/finetune_im/goal_no_noops_resume+libero_goal_no_noops+b32+lr-0.0005+lora-r32+dropout-0.0--image_aug--parallel_dec--8_acts_chunk--discrete_acts--proprio_state"
-    object_checkpoint="/mnt/data/lcx2/yanjieworkspace/models/finetune_im/openvla-7b+libero_object_no_noops+b40+lr-0.0005+lora-r32+dropout-0.0--image_aug--parallel_dec--8_acts_chunk--discrete_acts--proprio_state--100000_chkpt"
-    four_suites_checkpoint = "/cpfs01/liuwei_workspace/models/finetune_im/openvla-7b+libero_4_task_suites_no_noops+b32+lr-0.0005+lora-r32+dropout-0.0--image_aug--parallel_dec--8_acts_chunk--discrete_acts--proprio_state--4tasks--70000_chkpt"
-    libero10_checkpoint = '/cpfs01/liuwei_workspace/models/finetune_im/openvla-7b+libero_10_no_noops+b32+lr-0.0005+lora-r32+dropout-0.0--image_aug--parallel_dec--8_acts_chunk--discrete_acts--proprio_state'
+    # 本机 checkpoint 根目录（yiqinworkspace）
+    _ckpt_root = "/mnt/data/lcx1/yiqinworkspace/openvla_oft_rl_from_oss/weights_tmp"
+    spatial_checkpoint = f"{_ckpt_root}/openvla-7b+libero_spatial_no_noops+b32+lr-0.0005+lora-r32+dropout-0.0--image_aug--parallel_dec--8_acts_chunk--discrete_acts--proprio_state--100000_chkpt"
+    goal_checkpoint = f"{_ckpt_root}/goal_no_noops_resume+libero_goal_no_noops+b32+lr-0.0005+lora-r32+dropout-0.0--image_aug--parallel_dec--8_acts_chunk--discrete_acts--proprio_state"
+    object_checkpoint = f"{_ckpt_root}/openvla-7b+libero_object_no_noops+b40+lr-0.0005+lora-r32+dropout-0.0--image_aug--parallel_dec--8_acts_chunk--discrete_acts--proprio_state--100000_chkpt"
+    four_suites_checkpoint = f"{_ckpt_root}/openvla-7b+libero_4_task_suites_no_noops+b32+lr-0.0005+lora-r32+dropout-0.0--image_aug--parallel_dec--8_acts_chunk--discrete_acts--proprio_state--4tasks--70000_chkpt"
+    libero10_checkpoint = f"{_ckpt_root}/openvla-7b+libero_10_no_noops+b32+lr-0.0005+lora-r32+dropout-0.0--image_aug--parallel_dec--8_acts_chunk--discrete_acts--proprio_state"
     # Instantiate config
     cfg = GenerateConfig(
         pretrained_checkpoint=object_checkpoint,
@@ -695,9 +712,11 @@ if __name__ == "__main__":
             # 2. 为需要生成新动作的环境批量生成动作
             if inputs_t_list:
                 inputs_batch = actor.prepare_inputs_batch(inputs_t_list)
-                
+                print(f"[debug] 模型推理 batch_size={len(inputs_t_list)} ...", flush=True)
+
                 with torch.inference_mode():
                     action_logits, _ = actor.forward(inputs_batch)
+                print("[debug] 模型推理完成", flush=True)
                 B = action_logits.size(0)
                 deterministic_flags = [False] * B  # 若需贪心推理，改为 [True] * B
                 _, _, normalized_actions = actor.post_process(action_logits, deterministic_flags)  # 形状 (B, 8, 7)
@@ -728,6 +747,8 @@ if __name__ == "__main__":
                 
                 # 执行动作
                 time1 = time.time()
+                if episode_steps[i] == 0:
+                    print(f"[debug] 环境 {i} 首次 step, action={action_env}", flush=True)
                 obs, reward, terminated, truncated, info = envs[i].step(action_env)
                 time2 = time.time()
                 step_duration = time2 - time1

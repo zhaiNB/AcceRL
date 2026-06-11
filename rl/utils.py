@@ -535,25 +535,103 @@ def check_unnorm_key(cfg, model) -> None:
 def get_vla(cfg: Any, torch_dtype: torch.dtype = torch.bfloat16) -> torch.nn.Module:
     """
     只读加载 OpenVLA：不修改 checkpoint 内的 config.json。
+
+    兼容两类 checkpoint：
+    1. 完整导出的 HF checkpoint（目录内包含 model-0000x-of-0000y.safetensors 分片）
+    2. 仅保存了配置/索引 + LoRA adapter 的轻量目录（需要回退到 base model 再加载 adapter）
     """
     print("Instantiating pretrained VLA policy (read-only, no config.json mutation)...")
 
+    checkpoint_dir = Path(cfg.pretrained_checkpoint)
+
+    def _missing_shards(ckpt_dir: Path) -> list[str]:
+        index_file = ckpt_dir / "model.safetensors.index.json"
+        if not index_file.exists():
+            return []
+        try:
+            import json
+            with index_file.open("r", encoding="utf-8") as f:
+                weight_map = json.load(f).get("weight_map", {})
+            shard_names = sorted(set(weight_map.values()))
+            return [name for name in shard_names if not (ckpt_dir / name).exists()]
+        except Exception as e:
+            print(f"Warning: failed to inspect shard index {index_file}: {e}")
+            return []
+
+    missing_shards = _missing_shards(checkpoint_dir)
+    load_source = str(checkpoint_dir)
+    lora_dir = checkpoint_dir / "lora_adapter"
+    should_load_lora = False
+
+    def _normalize_model_source(model_source: str) -> str:
+        candidate = Path(model_source)
+        if candidate.exists():
+            return str(candidate)
+        # Hugging Face cache snapshot path on another machine, e.g.
+        # /.../models--openvla--openvla-7b/snapshots/<hash>
+        parts = candidate.parts
+        for part in parts:
+            if part.startswith("models--"):
+                repo_bits = part[len("models--"):].split("--")
+                if len(repo_bits) >= 2:
+                    repo_id = f"{repo_bits[0]}/{repo_bits[1]}"
+                    print(
+                        "Base model path from LoRA adapter does not exist locally; "
+                        f"falling back to Hugging Face repo id '{repo_id}'"
+                    )
+                    return repo_id
+        return model_source
+
+    if missing_shards:
+        print(
+            "Detected incomplete local checkpoint shards under "
+            f"{checkpoint_dir}. Missing files: {missing_shards}"
+        )
+        if lora_dir.exists() and (lora_dir / "adapter_config.json").exists():
+            from peft import PeftConfig
+
+            peft_cfg = PeftConfig.from_pretrained(str(lora_dir))
+            base_model_name_or_path = peft_cfg.base_model_name_or_path
+            if not base_model_name_or_path:
+                raise FileNotFoundError(
+                    f"Checkpoint {checkpoint_dir} is missing model shards {missing_shards}, "
+                    "and lora_adapter/adapter_config.json does not contain base_model_name_or_path."
+                )
+            normalized_source = _normalize_model_source(base_model_name_or_path)
+            print(
+                "Falling back to base model from LoRA adapter config: "
+                f"{normalized_source}"
+            )
+            load_source = normalized_source
+            should_load_lora = True
+        else:
+            raise FileNotFoundError(
+                f"Checkpoint {checkpoint_dir} is missing model shards: {missing_shards}. "
+                "Please sync the full checkpoint or provide a directory containing actual model shard files."
+            )
+
     # 1) 显式加载 Config（不会触发 auto_map 也不会写文件）
     vla_cfg = OpenVLAConfig.from_pretrained(
-        cfg.pretrained_checkpoint,
-        trust_remote_code=True,   # 允许自定义类
+        load_source,
+        trust_remote_code=True,
     )
 
     # 2) 显式加载模型（不走 Auto*，不需要 auto_map）
     vla = OpenVLAForActionPrediction.from_pretrained(
-        cfg.pretrained_checkpoint,
+        load_source,
         config=vla_cfg,
-        torch_dtype=torch_dtype,     #bfloat16 
+        torch_dtype=torch_dtype,
         load_in_8bit=cfg.load_in_8bit,
         load_in_4bit=cfg.load_in_4bit,
         low_cpu_mem_usage=True,
         trust_remote_code=True,
     ).to(cfg.device)
+
+    if should_load_lora:
+        print(f"Loading LoRA adapter weights from {lora_dir}")
+        vla = PeftModel.from_pretrained(vla, str(lora_dir), is_trainable=bool(getattr(cfg, "use_lora", False)))
+        if not getattr(cfg, "use_lora", False):
+            vla = vla.merge_and_unload()
 
     # 3) FiLM（若启用）
     if getattr(cfg, "use_film", False):

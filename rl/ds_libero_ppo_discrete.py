@@ -18,6 +18,7 @@ import asyncio
 from collections import deque, defaultdict
 from typing import Dict, Optional, Tuple, List
 from dataclasses import dataclass
+from pathlib import Path
 import math
 
 import numpy as np
@@ -150,7 +151,7 @@ def parse_args():
     parser.add_argument('--num-images-in-input', type=int, default=1,
                         help='Number of images in input (default: 1)')
     parser.add_argument('--pretrained-checkpoint', type=str,
-                        default='/cpfs01/liuwei_workspace/models/finetune_im/openvla-7b+libero_spatial_no_noops+b32+lr-0.0005+lora-r32+dropout-0.0--image_aug--parallel_dec--8_acts_chunk--discrete_acts--proprio_state--100000_chkpt',
+                        default='/mnt/data/lcx1/yiqinworkspace/openvla_oft_rl_from_oss/weights_tmp/openvla-7b+libero_object_no_noops+b40+lr-0.0005+lora-r32+dropout-0.0--image_aug--parallel_dec--8_acts_chunk--discrete_acts--proprio_state--100000_chkpt',
                         help='Pretrained checkpoint path')
     parser.add_argument('--checkpoint2', type=str,
                         default='',
@@ -224,7 +225,31 @@ def parse_args():
     
     # 设置 CUDA_VISIBLE_DEVICES 环境变量
     os.environ["CUDA_VISIBLE_DEVICES"] = args.cuda_visible_devices
-    
+
+    # 兜底解析 checkpoint：优先用用户显式传入的路径；如果默认路径不存在，则尝试工作区内可用目录
+    default_ckpt = '/mnt/data/lcx1/yiqinworkspace/openvla_oft_rl_from_oss/weights_tmp/openvla-7b+libero_object_no_noops+b40+lr-0.0005+lora-r32+dropout-0.0--image_aug--parallel_dec--8_acts_chunk--discrete_acts--proprio_state--100000_chkpt'
+    candidate_ckpts = [
+        args.pretrained_checkpoint,
+        default_ckpt,
+    ]
+    resolved_ckpt = None
+    for candidate in candidate_ckpts:
+        if candidate and os.path.exists(candidate):
+            resolved_ckpt = candidate
+            break
+
+    if resolved_ckpt is None:
+        weights_root = Path('/mnt/data/lcx1/yiqinworkspace/openvla_oft_rl_from_oss/weights_tmp')
+        if weights_root.exists():
+            benchmark_prefix = f"openvla-7b+{args.benchmark}_no_noops"
+            matching_dirs = sorted([p for p in weights_root.iterdir() if p.is_dir() and p.name.startswith(benchmark_prefix)])
+            if matching_dirs:
+                resolved_ckpt = str(matching_dirs[-1])
+
+    if resolved_ckpt is not None and resolved_ckpt != args.pretrained_checkpoint:
+        print(f"自动将 pretrained_checkpoint 从 '{args.pretrained_checkpoint}' 切换为 '{resolved_ckpt}'")
+        args.pretrained_checkpoint = resolved_ckpt
+
     # 如果没有提供 exp_name，自动生成
     if args.exp_name is None:
         args.exp_name = f"OpenVLA_DS_{args.clip_mode}_DISCRETE_task0_10k_buffer"
@@ -1735,7 +1760,11 @@ def main(args):
     benchmark = args.benchmark
     
     if not os.path.exists(args.pretrained_checkpoint):
-        print(f"错误: OpenVLA checkpoint 路径 '{args.pretrained_checkpoint}' 不存在。请更新 PRETRAINED_CHECKPOINT。")
+        candidate_hint = '/mnt/data/lcx1/yiqinworkspace/openvla_oft_rl_from_oss/weights_tmp'
+        print(
+            f"错误: OpenVLA checkpoint 路径 '{args.pretrained_checkpoint}' 不存在。"
+            f"请传入有效 --pretrained-checkpoint，或检查候选目录 {candidate_hint} 下是否存在可用 checkpoint。"
+        )
         return
 
     os.environ["RAY_DEDUP_LOGS"] = "0"
